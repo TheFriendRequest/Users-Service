@@ -1,24 +1,27 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
 
-class UserBase(BaseModel):
-    name: str
-    email: EmailStr
-    hobbies: Optional[str] = None
-    free_time: Optional[str] = None
 
-class UserCreate(UserBase):
-    password: str
+class UserCreate(BaseModel):
+    first_name: str
+    last_name: str
+    username: str
+    email: str
+    profile_picture: Optional[str] = None
+
+
+class UserSync(BaseModel):
+    """Model for syncing Firebase user to database"""
+    first_name: str
+    last_name: str
+    username: str
+    email: str
+    profile_picture: Optional[str] = None
+
 
 class UserUpdate(BaseModel):
-    name: Optional[str] = None
-    hobbies: Optional[str] = None
-    free_time: Optional[str] = None
-
-class User(UserBase):
-    user_id: int
-    created_at: datetime
-
-    class Config:
-        orm_mode = True
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    username: Optional[str] = None
+    email: Optional[str] = None
+    profile_picture: Optional[str] = None
