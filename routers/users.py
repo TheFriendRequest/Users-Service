@@ -1,11 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Response, Header
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List, cast
 import os
 import sys
 import mysql.connector
+import hashlib
+import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import verify_firebase_token, get_firebase_uid
+from auth import get_firebase_uid
 from models import UserCreate, UserSync, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -18,9 +20,18 @@ def get_connection():
     return mysql.connector.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
         user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASS", 'admin'),
+        password=os.getenv("DB_PASSWORD", 'admin'),
         database=os.getenv("DB_NAME", "user_db")
     )
+
+
+# ----------------------
+# Helper: Generate eTag
+# ----------------------
+def generate_etag(data: Any) -> str:
+    """Generate eTag from data"""
+    data_str = json.dumps(data, sort_keys=True, default=str)
+    return hashlib.md5(data_str.encode()).hexdigest()
 
 
 # ----------------------
@@ -34,6 +45,7 @@ def get_users(firebase_uid: str = Depends(get_firebase_uid)):
     Returns list of users excluding sensitive information.
     """
     cnx = get_connection()
+    print(f"[Users Service] Connected to database: {cnx}")
     cur = cnx.cursor(dictionary=True)
     cur.execute("SELECT user_id, first_name, last_name, username, email, profile_picture, created_at FROM Users")
     data = cur.fetchall()
@@ -43,9 +55,12 @@ def get_users(firebase_uid: str = Depends(get_firebase_uid)):
 
 
 @router.get("/me")
-def get_current_user(firebase_uid: str = Depends(get_firebase_uid)):
+def get_current_user(
+    response: Response,
+    firebase_uid: str = Depends(get_firebase_uid)
+):
     """
-    Get current authenticated user's profile.
+    Get current authenticated user's profile with ETag support.
     """
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -56,6 +71,12 @@ def get_current_user(firebase_uid: str = Depends(get_firebase_uid)):
 
     if not row:
         raise HTTPException(status_code=404, detail="User not found in database. Please sync your account first.")
+
+    # Generate eTag for the user profile
+    etag = generate_etag(row)
+    response.headers["ETag"] = f'"{etag}"'
+    print(f"[Users Service] Generated ETag for user profile: {etag}")
+    print(f"[Users Service] ETag header set: {response.headers.get('ETag')}")
 
     return row
 
@@ -250,8 +271,12 @@ def delete_user(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
 # SCHEDULE ENDPOINTS
 # ----------------------
 @router.get("/{user_id}/schedules")
-def get_user_schedules(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
-    """Get all schedules for a user"""
+def get_user_schedules(
+    user_id: int,
+    response: Response,
+    firebase_uid: str = Depends(get_firebase_uid)
+):
+    """Get all schedules for a user with ETag support"""
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -277,6 +302,13 @@ def get_user_schedules(user_id: int, firebase_uid: str = Depends(get_firebase_ui
     schedules = cur.fetchall()
     cur.close()
     cnx.close()
+    
+    # Generate eTag for the schedules collection
+    etag = generate_etag(schedules)
+    response.headers["ETag"] = f'"{etag}"'
+    print(f"[Users Service] Generated ETag for schedules: {etag}")
+    print(f"[Users Service] ETag header set: {response.headers.get('ETag')}")
+    
     return schedules
 
 
@@ -361,7 +393,7 @@ def get_interests(firebase_uid: str = Depends(get_firebase_uid)):
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     cur.execute("SELECT interest_id, interest_name FROM Interests ORDER BY interest_name")
-    interests = cur.fetchall()
+    interests = cast(List[Dict[str, Any]], cur.fetchall())
     cur.close()
     cnx.close()
     return interests
@@ -379,7 +411,7 @@ def get_user_interests(user_id: int, firebase_uid: str = Depends(get_firebase_ui
         WHERE ui.user_id = %s
         ORDER BY i.interest_name
     """, (user_id,))
-    interests = cur.fetchall()
+    interests = cast(List[Dict[str, Any]], cur.fetchall())
     cur.close()
     cnx.close()
     return interests
