@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
-from typing import Optional, Dict, Any, cast
+from typing import Optional, Dict, Any, List, cast
 import os
 import sys
 import mysql.connector
@@ -19,7 +19,7 @@ def get_connection():
         host=os.getenv("DB_HOST", "127.0.0.1"),
         user=os.getenv("DB_USER", "root"),
         password=os.getenv("DB_PASS", 'admin'),
-        database=os.getenv("DB_NAME", "friend_request_db")
+        database=os.getenv("DB_NAME", "user_db")
     )
 
 
@@ -244,3 +244,188 @@ def delete_user(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
     cnx.close()
 
     return {"status": "deleted", "user_id": user_id}
+
+
+# ----------------------
+# SCHEDULE ENDPOINTS
+# ----------------------
+@router.get("/{user_id}/schedules")
+def get_user_schedules(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
+    """Get all schedules for a user"""
+    # Verify user owns this account
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cast(Optional[Dict[str, Any]], cur.fetchone())
+    
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="Authentication required")
+    
+    if current_user['user_id'] != user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only view your own schedules")
+    
+    cur.execute("""
+        SELECT schedule_id, user_id, start_time, end_time, type, title
+        FROM UserSchedule
+        WHERE user_id = %s
+        ORDER BY start_time ASC
+    """, (user_id,))
+    schedules = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return schedules
+
+
+@router.post("/{user_id}/schedules", status_code=status.HTTP_201_CREATED)
+def create_user_schedule(
+    user_id: int,
+    schedule: Dict[str, Any],
+    firebase_uid: str = Depends(get_firebase_uid)
+):
+    """Create a new schedule for a user"""
+    # Verify user owns this account
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cast(Optional[Dict[str, Any]], cur.fetchone())
+    
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="Authentication required")
+    
+    if current_user['user_id'] != user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only create schedules for yourself")
+    
+    sql = """
+        INSERT INTO UserSchedule (user_id, start_time, end_time, type, title)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+    values = (
+        user_id,
+        schedule['start_time'],
+        schedule['end_time'],
+        schedule['type'],
+        schedule['title']
+    )
+    cur.execute(sql, values)
+    cnx.commit()
+    schedule_id = cur.lastrowid
+    cur.close()
+    cnx.close()
+    return {"status": "created", "schedule_id": schedule_id}
+
+
+@router.delete("/{user_id}/schedules/{schedule_id}")
+def delete_user_schedule(
+    user_id: int,
+    schedule_id: int,
+    firebase_uid: str = Depends(get_firebase_uid)
+):
+    """Delete a schedule for a user"""
+    # Verify user owns this account
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cast(Optional[Dict[str, Any]], cur.fetchone())
+    
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="Authentication required")
+    
+    if current_user['user_id'] != user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only delete your own schedules")
+    
+    cur.execute("DELETE FROM UserSchedule WHERE schedule_id = %s AND user_id = %s", (schedule_id, user_id))
+    cnx.commit()
+    cur.close()
+    cnx.close()
+    return {"status": "deleted", "schedule_id": schedule_id}
+
+
+# ----------------------
+# INTEREST ENDPOINTS
+# ----------------------
+@router.get("/interests")
+def get_interests(firebase_uid: str = Depends(get_firebase_uid)):
+    """Get all available interests"""
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT interest_id, interest_name FROM Interests ORDER BY interest_name")
+    interests = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return interests
+
+
+@router.get("/{user_id}/interests")
+def get_user_interests(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
+    """Get all interests for a user"""
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("""
+        SELECT i.interest_id, i.interest_name
+        FROM Interests i
+        INNER JOIN UserInterests ui ON i.interest_id = ui.interest_id
+        WHERE ui.user_id = %s
+        ORDER BY i.interest_name
+    """, (user_id,))
+    interests = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return interests
+
+
+@router.post("/{user_id}/interests", status_code=status.HTTP_201_CREATED)
+def add_user_interests(
+    user_id: int,
+    interest_ids: List[int],
+    firebase_uid: str = Depends(get_firebase_uid)
+):
+    """Add interests to a user (replaces existing)"""
+    # Verify user owns this account
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cast(Optional[Dict[str, Any]], cur.fetchone())
+    
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="Authentication required")
+    
+    if current_user['user_id'] != user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only update your own interests")
+    
+    # Delete existing interests
+    cur.execute("DELETE FROM UserInterests WHERE user_id = %s", (user_id,))
+    
+    # Add new interests
+    for interest_id in interest_ids:
+        # Verify interest exists
+        cur.execute("SELECT interest_id FROM Interests WHERE interest_id = %s", (interest_id,))
+        if not cur.fetchone():
+            cur.close()
+            cnx.close()
+            raise HTTPException(status_code=400, detail=f"Interest {interest_id} not found")
+        
+        cur.execute(
+            "INSERT INTO UserInterests (user_id, interest_id) VALUES (%s, %s)",
+            (user_id, interest_id)
+        )
+    
+    cnx.commit()
+    cur.close()
+    cnx.close()
+    return {"status": "updated", "user_id": user_id, "interest_ids": interest_ids}
