@@ -17,3 +17,7 @@ app.include_router(users.router)
 @app.get("/")
 def root():
     return {"status": "Users Service running"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "users"}

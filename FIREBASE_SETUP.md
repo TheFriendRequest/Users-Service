@@ -79,7 +79,7 @@ This service uses Firebase Authentication for user login (Google Sign-In) while 
    REACT_APP_FIREBASE_STORAGE_BUCKET=your-project.appspot.com
    REACT_APP_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
    REACT_APP_FIREBASE_APP_ID=your_app_id
-   REACT_APP_USERS_SERVICE_URL=http://localhost:8000
+   REACT_APP_USERS_SERVICE_URL=http://localhost:8002
    ```
 
 2. Install dependencies:
