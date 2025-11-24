@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Response, Header
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List, cast
+from datetime import datetime
 import os
 import sys
 import mysql.connector
@@ -14,14 +15,14 @@ router = APIRouter(prefix="/users", tags=["Users"])
 
 
 # ----------------------
-# DB
+# DB 
 # ----------------------
 def get_connection():
     return mysql.connector.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
         user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", 'admin'),
-        database=os.getenv("DB_NAME", "user_db")
+        password=os.getenv("DB_PASS", 'admin'),
+        database=os.getenv("DB_NAME", "user_db"),
     )
 
 
@@ -335,14 +336,50 @@ def create_user_schedule(
         cnx.close()
         raise HTTPException(status_code=403, detail="You can only create schedules for yourself")
     
+    # Convert ISO 8601 datetime strings to MySQL datetime format
+    def convert_to_mysql_datetime(iso_string: str) -> str:
+        """Convert ISO 8601 format (2025-11-23T23:33:00.000Z) to MySQL format (2025-11-23 23:33:00)"""
+        if not isinstance(iso_string, str):
+            raise HTTPException(status_code=400, detail=f"Invalid datetime: expected string, got {type(iso_string)}")
+        
+        try:
+            # Handle ISO 8601 with Z (UTC) timezone
+            if iso_string.endswith('Z'):
+                # Replace Z with +00:00 for fromisoformat
+                iso_string = iso_string.replace('Z', '+00:00')
+            
+            # Parse ISO string (handles both with and without timezone)
+            if '+' in iso_string or iso_string.count('-') > 2:
+                # Has timezone info
+                dt = datetime.fromisoformat(iso_string)
+            else:
+                # No timezone, assume local or UTC
+                # Try parsing with milliseconds first
+                try:
+                    dt = datetime.strptime(iso_string, '%Y-%m-%dT%H:%M:%S.%f')
+                except ValueError:
+                    # Try without milliseconds
+                    dt = datetime.strptime(iso_string, '%Y-%m-%dT%H:%M:%S')
+            
+            # Convert to MySQL datetime format: YYYY-MM-DD HH:MM:SS
+            return dt.strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, AttributeError) as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid datetime format: {iso_string}. Error: {str(e)}"
+            )
+    
+    start_time = convert_to_mysql_datetime(schedule['start_time'])
+    end_time = convert_to_mysql_datetime(schedule['end_time'])
+    
     sql = """
         INSERT INTO UserSchedule (user_id, start_time, end_time, type, title)
         VALUES (%s, %s, %s, %s, %s)
     """
     values = (
         user_id,
-        schedule['start_time'],
-        schedule['end_time'],
+        start_time,
+        end_time,
         schedule['type'],
         schedule['title']
     )
