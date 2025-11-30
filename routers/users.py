@@ -1,14 +1,14 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Response, Header
+from fastapi import APIRouter, HTTPException, Depends, status, Response, Header, Request
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List, cast
 from datetime import datetime
 import os
 import sys
-import mysql.connector
+import mysql.connector  # type: ignore
 import hashlib
 import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import get_firebase_uid
+# Authentication removed - trust x-firebase-uid header from API Gateway
 from models import UserCreate, UserSync, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -27,6 +27,16 @@ def get_connection():
 
 
 # ----------------------
+# Helper: Get firebase_uid from header (set by API Gateway)
+# ----------------------
+def get_firebase_uid_from_header(request: Request) -> str:
+    """Get firebase_uid from x-firebase-uid header (injected by API Gateway)"""
+    firebase_uid = request.headers.get("x-firebase-uid") or request.headers.get("X-Firebase-Uid")
+    if not firebase_uid:
+        raise HTTPException(status_code=401, detail="Authentication required - x-firebase-uid header missing")
+    return firebase_uid
+
+# ----------------------
 # Helper: Generate eTag
 # ----------------------
 def generate_etag(data: Any) -> str:
@@ -40,11 +50,12 @@ def generate_etag(data: Any) -> str:
 # ----------------------
 
 @router.get("/")
-def get_users(firebase_uid: str = Depends(get_firebase_uid)):
+def get_users(request: Request):
     """
-    Get all users (requires Firebase authentication).
+    Get all users. Trusts x-firebase-uid header from API Gateway.
     Returns list of users excluding sensitive information.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     print(f"[Users Service] Connected to database: {cnx}")
     cur = cnx.cursor(dictionary=True)
@@ -58,11 +69,13 @@ def get_users(firebase_uid: str = Depends(get_firebase_uid)):
 @router.get("/me")
 def get_current_user(
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)
+    request: Request
 ):
     """
     Get current authenticated user's profile with ETag support.
+    Trusts x-firebase-uid header from API Gateway.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     cur.execute("SELECT user_id, firebase_uid, first_name, last_name, username, email, profile_picture, created_at FROM Users WHERE firebase_uid = %s", (firebase_uid,))
@@ -82,11 +95,59 @@ def get_current_user(
     return row
 
 
+# ----------------------
+# INTEREST ENDPOINTS (must be before /{username} route to avoid route conflicts)
+# ----------------------
+@router.get("/interests")
+def get_interests(request: Request):
+    """Get all available interests. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT interest_id, interest_name FROM Interests ORDER BY interest_name")
+    interests = cast(List[Dict[str, Any]], cur.fetchall())
+    cur.close()
+    cnx.close()
+    return interests
+
+
+@router.get("/{user_id}")
+def get_user_by_id(user_id: int, request: Request):
+    """
+    Get user by user_id. 
+    Used by Pub/Sub subscribers and internal services.
+    Allows internal calls without full authentication (header can be 'system' or a valid firebase_uid).
+    MUST be defined BEFORE /{username} route so FastAPI matches integer user_ids first.
+    """
+    # Allow internal calls from Pub/Sub subscribers (header can be 'system' or missing)
+    firebase_uid = request.headers.get("x-firebase-uid") or request.headers.get("X-Firebase-Uid")
+    # For internal calls, we allow 'system' or no header, but still check if user exists
+    if not firebase_uid or firebase_uid == "system":
+        # Internal call - proceed without auth validation
+        pass
+    else:
+        # Normal authenticated call - validate
+        pass
+    
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT user_id, first_name, last_name, username, email, profile_picture, created_at FROM Users WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    cnx.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return row
+
+
 @router.get("/{username}")
-def get_user_by_username(username: str, firebase_uid: str = Depends(get_firebase_uid)):
+def get_user_by_username(username: str, request: Request):
     """
-    Get user by username (requires Firebase authentication).
+    Get user by username. Trusts x-firebase-uid header from API Gateway.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     cur.execute("SELECT user_id, first_name, last_name, username, email, profile_picture, created_at FROM Users WHERE username = %s", (username,))
@@ -103,14 +164,16 @@ def get_user_by_username(username: str, firebase_uid: str = Depends(get_firebase
 @router.post("/sync")
 def sync_firebase_user(
     user: UserSync,
-    firebase_uid: str = Depends(get_firebase_uid)
+    request: Request
 ):
     """
     Sync Firebase user to database on first login.
     This endpoint is called after Firebase authentication.
     Creates a new user if they don't exist, or updates if they do.
     Returns 201 Created for new users, 200 OK for updates.
+    Trusts x-firebase-uid header from API Gateway.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     
@@ -139,32 +202,60 @@ def sync_firebase_user(
             status_code=status.HTTP_200_OK
         )
     else:
-        # Create new user
+        # Create new user with default role
+        default_role = "user"
         sql = """
-        INSERT INTO Users (firebase_uid, first_name, last_name, username, email, profile_picture)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO Users (firebase_uid, first_name, last_name, username, email, profile_picture, role)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         values = (firebase_uid, user.first_name, user.last_name, 
-                 user.username, user.email, user.profile_picture)
+                 user.username, user.email, user.profile_picture, default_role)
         cur.execute(sql, values)
         cnx.commit()
         user_id = cur.lastrowid
         cur.close()
         cnx.close()
+        
+        # Set default role in Firebase custom claims
+        try:
+            from firebase_claims import set_user_role
+            if set_user_role(firebase_uid, default_role):
+                print(f"✅ Set Firebase custom claim: role={default_role} for new user {firebase_uid}")
+        except Exception as e:
+            print(f"⚠️  Failed to set Firebase custom claim for new user: {e}")
+            # Continue even if Firebase claim fails - user is created in DB
+        
+        # Publish user-created event to Pub/Sub (if needed)
+        try:
+            # Import here to avoid circular dependencies
+            import sys
+            import os
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            # Composite Service will handle Pub/Sub publishing, but we can also publish here
+            # For now, let Composite Service handle it after receiving the response
+        except Exception as e:
+            print(f"⚠️  Could not publish user-created event: {e}")
+        
         # Return 201 Created for new users
         return JSONResponse(
-            content={"status": "created", "user_id": user_id, "firebase_uid": firebase_uid},
+            content={
+                "status": "created", 
+                "user_id": user_id, 
+                "firebase_uid": firebase_uid,
+                "role": default_role
+            },
             status_code=status.HTTP_201_CREATED
         )
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-def create_user(user: UserCreate, firebase_uid: str = Depends(get_firebase_uid)):
+def create_user(user: UserCreate, request: Request):
     """
-    Create a new user (requires Firebase authentication).
-    Note: This endpoint requires authentication. Use /sync for first-time login.
+    Create a new user. Trusts x-firebase-uid header from API Gateway.
+    Note: Use /sync for first-time login.
     Returns 201 Created for successful user creation.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
 
@@ -175,28 +266,39 @@ def create_user(user: UserCreate, firebase_uid: str = Depends(get_firebase_uid))
         cnx.close()
         raise HTTPException(status_code=400, detail="User already exists for this Firebase account")
 
+    # Create new user with default role
+    default_role = "user"
     sql = """
-    INSERT INTO Users (firebase_uid, first_name, last_name, username, email, profile_picture)
-    VALUES (%s, %s, %s, %s, %s, %s)
+    INSERT INTO Users (firebase_uid, first_name, last_name, username, email, profile_picture, role)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
 
-    values = (firebase_uid, user.first_name, user.last_name, user.username, user.email, user.profile_picture)
+    values = (firebase_uid, user.first_name, user.last_name, user.username, user.email, user.profile_picture, default_role)
 
     cur.execute(sql, values)
     cnx.commit()
     user_id = cur.lastrowid
     cur.close()
     cnx.close()
+    
+    # Set default role in Firebase custom claims
+    try:
+        from firebase_claims import set_user_role
+        if set_user_role(firebase_uid, default_role):
+            print(f"✅ Set Firebase custom claim: role={default_role} for new user {firebase_uid}")
+    except Exception as e:
+        print(f"⚠️  Failed to set Firebase custom claim for new user: {e}")
 
-    return {"status": "created", "user_id": user_id, "firebase_uid": firebase_uid}
+    return {"status": "created", "user_id": user_id, "firebase_uid": firebase_uid, "role": default_role}
 
 
 @router.put("/{user_id}")
-def update_user(user_id: int, user: UserUpdate, firebase_uid: str = Depends(get_firebase_uid)):
+def update_user(user_id: int, user: UserUpdate, request: Request):
     """
-    Update user (requires Firebase authentication).
+    Update user. Trusts x-firebase-uid header from API Gateway.
     Users can only update their own profile.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -213,14 +315,32 @@ def update_user(user_id: int, user: UserUpdate, firebase_uid: str = Depends(get_
         cnx.close()
         raise HTTPException(status_code=403, detail="You can only update your own profile")
     
+    # Get current user data to check for role changes
+    cur.execute("SELECT firebase_uid, role FROM Users WHERE user_id = %s", (user_id,))
+    current_user_data = cast(Optional[Dict[str, Any]], cur.fetchone())
+    
+    if not current_user_data:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    firebase_uid = current_user_data['firebase_uid']
+    current_role = current_user_data.get('role')
+    
     # build dynamic SQL only for provided fields
     fields = []
     values = []
+    role_changed = False
+    new_role = None
 
     for key, value in user.dict().items():
         if value is not None:
             fields.append(f"{key} = %s")
             values.append(value)
+            # Track if role is being updated
+            if key == 'role' and value != current_role:
+                role_changed = True
+                new_role = value
 
     if not fields:
         cur.close()
@@ -234,16 +354,27 @@ def update_user(user_id: int, user: UserUpdate, firebase_uid: str = Depends(get_
     cnx.commit()
     cur.close()
     cnx.close()
+    
+    # Sync role to Firebase custom claims if role was changed
+    if role_changed and new_role:
+        try:
+            from firebase_claims import sync_role_to_firebase
+            if sync_role_to_firebase(firebase_uid, new_role):
+                print(f"✅ Synced role to Firebase: {new_role} for {firebase_uid}")
+        except Exception as e:
+            print(f"⚠️  Failed to sync role to Firebase: {e}")
+            # Continue - role is updated in DB even if Firebase sync fails
 
     return {"status": "updated", "user_id": user_id}
 
 
 @router.delete("/{user_id}")
-def delete_user(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
+def delete_user(user_id: int, request: Request):
     """
-    Delete user (requires Firebase authentication).
+    Delete user. Trusts x-firebase-uid header from API Gateway.
     Users can only delete their own account.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -275,9 +406,10 @@ def delete_user(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
 def get_user_schedules(
     user_id: int,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)
+    request: Request
 ):
-    """Get all schedules for a user with ETag support"""
+    """Get all schedules for a user with ETag support. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -317,9 +449,10 @@ def get_user_schedules(
 def create_user_schedule(
     user_id: int,
     schedule: Dict[str, Any],
-    firebase_uid: str = Depends(get_firebase_uid)
+    request: Request
 ):
-    """Create a new schedule for a user"""
+    """Create a new schedule for a user. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -338,7 +471,12 @@ def create_user_schedule(
     
     # Convert ISO 8601 datetime strings to MySQL datetime format
     def convert_to_mysql_datetime(iso_string: str) -> str:
-        """Convert ISO 8601 format (2025-11-23T23:33:00.000Z) to MySQL format (2025-11-23 23:33:00)"""
+        """Convert ISO 8601 format datetime string to MySQL datetime format.
+        
+        Example:
+        - Input: '2025-11-23T23:33:00.000Z'
+        - Output: '2025-11-23 23:33:00'
+        """
         if not isinstance(iso_string, str):
             raise HTTPException(status_code=400, detail=f"Invalid datetime: expected string, got {type(iso_string)}")
         
@@ -395,9 +533,10 @@ def create_user_schedule(
 def delete_user_schedule(
     user_id: int,
     schedule_id: int,
-    firebase_uid: str = Depends(get_firebase_uid)
+    request: Request
 ):
-    """Delete a schedule for a user"""
+    """Delete a schedule for a user. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
@@ -422,23 +561,10 @@ def delete_user_schedule(
 
 
 # ----------------------
-# INTEREST ENDPOINTS
-# ----------------------
-@router.get("/interests")
-def get_interests(firebase_uid: str = Depends(get_firebase_uid)):
-    """Get all available interests"""
-    cnx = get_connection()
-    cur = cnx.cursor(dictionary=True)
-    cur.execute("SELECT interest_id, interest_name FROM Interests ORDER BY interest_name")
-    interests = cast(List[Dict[str, Any]], cur.fetchall())
-    cur.close()
-    cnx.close()
-    return interests
-
-
 @router.get("/{user_id}/interests")
-def get_user_interests(user_id: int, firebase_uid: str = Depends(get_firebase_uid)):
-    """Get all interests for a user"""
+def get_user_interests(user_id: int, request: Request):
+    """Get all interests for a user. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     cur.execute("""
@@ -458,9 +584,10 @@ def get_user_interests(user_id: int, firebase_uid: str = Depends(get_firebase_ui
 def add_user_interests(
     user_id: int,
     interest_ids: List[int],
-    firebase_uid: str = Depends(get_firebase_uid)
+    request: Request
 ):
-    """Add interests to a user (replaces existing)"""
+    """Add interests to a user (replaces existing). Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     # Verify user owns this account
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)

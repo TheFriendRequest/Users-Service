@@ -14,6 +14,13 @@ app.add_middleware(
 
 app.include_router(users.router)
 
+# Include admin router if it exists
+try:
+    from routers import admin
+    app.include_router(admin.router)
+except ImportError:
+    pass  # Admin router is optional
+
 @app.get("/")
 def root():
     return {"status": "Users Service running"}
