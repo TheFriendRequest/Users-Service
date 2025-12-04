@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Response, Header, Request
+from fastapi import APIRouter, HTTPException, Depends, status, Response, Header, Request, Query
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List, cast
 from datetime import datetime
@@ -109,6 +109,536 @@ def get_interests(request: Request):
     cur.close()
     cnx.close()
     return interests
+
+
+# ----------------------
+# SEARCH ENDPOINT (must be before /{user_id} and /{username} routes to avoid route conflicts)
+# ----------------------
+@router.get("/search")
+def search_users(
+    request: Request,
+    q: str = Query(..., min_length=1, description="Search query (name or username)")
+):
+    """
+    Search for users by name or username.
+    Returns users matching the search query, excluding current user and existing friends.
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Search for users matching query (excluding current user)
+    search_pattern = f"%{q}%"
+    cur.execute("""
+        SELECT DISTINCT u.user_id, u.first_name, u.last_name, u.username, u.email, u.profile_picture
+        FROM Users u
+        WHERE (u.first_name LIKE %s OR u.last_name LIKE %s OR u.username LIKE %s)
+        AND u.user_id != %s
+        ORDER BY u.first_name, u.last_name
+        LIMIT 50
+    """, (search_pattern, search_pattern, search_pattern, current_user_id))
+    
+    users = cur.fetchall()
+    
+    # Get existing friendships to exclude
+    cur.execute("""
+        SELECT 
+            CASE 
+                WHEN user_id_1 = %s THEN user_id_2
+                WHEN user_id_2 = %s THEN user_id_1
+            END as friend_id,
+            status
+        FROM Friendships
+        WHERE (user_id_1 = %s OR user_id_2 = %s)
+    """, (current_user_id, current_user_id, current_user_id, current_user_id))
+    
+    friendships = {row['friend_id']: row['status'] for row in cur.fetchall()}
+    
+    # Add friendship status to each user
+    for user in users:
+        friend_id = user['user_id']
+        if friend_id in friendships:
+            user['friendship_status'] = friendships[friend_id]
+        else:
+            user['friendship_status'] = None
+    
+    cur.close()
+    cnx.close()
+    return users
+
+
+# ----------------------
+# FRIENDSHIP ENDPOINTS (must be before /{user_id} and /{username} routes to avoid route conflicts)
+# ----------------------
+
+@router.post("/friends/requests", status_code=status.HTTP_201_CREATED)
+def send_friend_request(
+    to_user_id: int,
+    request: Request
+):
+    """
+    Send a friend request to another user.
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    from_user_id = current_user['user_id']
+    
+    # Validate target user exists
+    cur.execute("SELECT user_id FROM Users WHERE user_id = %s", (to_user_id,))
+    target_user = cur.fetchone()
+    if not target_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Target user not found")
+    
+    # Can't send request to yourself
+    if from_user_id == to_user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=400, detail="Cannot send friend request to yourself")
+    
+    # Check if friendship already exists
+    cur.execute("""
+        SELECT friendship_id, status, user_id_1, user_id_2
+        FROM Friendships
+        WHERE (user_id_1 = %s AND user_id_2 = %s) OR (user_id_1 = %s AND user_id_2 = %s)
+    """, (from_user_id, to_user_id, to_user_id, from_user_id))
+    
+    existing = cur.fetchone()
+    
+    if existing:
+        status_existing = existing['status']
+        if status_existing == 'accepted':
+            cur.close()
+            cnx.close()
+            raise HTTPException(status_code=400, detail="You are already friends with this user")
+        elif status_existing == 'pending':
+            cur.close()
+            cnx.close()
+            raise HTTPException(status_code=400, detail="Friend request already pending")
+    
+    # Create friend request (always use smaller user_id as user_id_1 for consistency)
+    # Store requested_by to track who sent the request
+    user_id_1 = min(from_user_id, to_user_id)
+    user_id_2 = max(from_user_id, to_user_id)
+    
+    cur.execute("""
+        INSERT INTO Friendships (user_id_1, user_id_2, requested_by, status)
+        VALUES (%s, %s, %s, 'pending')
+    """, (user_id_1, user_id_2, from_user_id))
+    
+    cnx.commit()
+    friendship_id = cur.lastrowid
+    
+    cur.execute("""
+        SELECT friendship_id, user_id_1, user_id_2, status, created_at
+        FROM Friendships
+        WHERE friendship_id = %s
+    """, (friendship_id,))
+    
+    result = cur.fetchone()
+    cur.close()
+    cnx.close()
+    
+    return result
+
+
+@router.get("/friends/requests/pending")
+def get_pending_requests(request: Request):
+    """
+    Get incoming pending friend requests for the current user.
+    Returns requests where current user is the recipient (can accept/reject).
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Get pending requests where current user is the recipient (incoming requests)
+    # Current user is recipient if requested_by != current_user_id
+    cur.execute("""
+        SELECT 
+            f.friendship_id,
+            f.user_id_1,
+            f.user_id_2,
+            f.requested_by,
+            f.status,
+            f.created_at,
+            f.requested_by as sender_user_id,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u1.user_id
+                ELSE u2.user_id
+            END as sender_id,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u1.first_name
+                ELSE u2.first_name
+            END as sender_first_name,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u1.last_name
+                ELSE u2.last_name
+            END as sender_last_name,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u1.username
+                ELSE u2.username
+            END as sender_username,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u1.profile_picture
+                ELSE u2.profile_picture
+            END as sender_profile_picture
+        FROM Friendships f
+        LEFT JOIN Users u1 ON f.user_id_1 = u1.user_id
+        LEFT JOIN Users u2 ON f.user_id_2 = u2.user_id
+        WHERE (f.user_id_1 = %s OR f.user_id_2 = %s)
+        AND f.status = 'pending'
+        AND f.requested_by != %s
+        ORDER BY f.created_at DESC
+    """, (current_user_id, current_user_id, current_user_id))
+    
+    requests = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return requests
+
+
+@router.get("/friends/requests/sent")
+def get_sent_requests(request: Request):
+    """
+    Get outgoing pending friend requests sent by the current user.
+    Returns requests where current user is the sender (can cancel).
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Get pending requests where current user is the sender (outgoing requests)
+    # Current user is sender if requested_by = current_user_id
+    cur.execute("""
+        SELECT 
+            f.friendship_id,
+            f.user_id_1,
+            f.user_id_2,
+            f.requested_by,
+            f.status,
+            f.created_at,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN f.user_id_2
+                ELSE f.user_id_1
+            END as recipient_user_id,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u2.user_id
+                ELSE u1.user_id
+            END as recipient_id,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u2.first_name
+                ELSE u1.first_name
+            END as recipient_first_name,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u2.last_name
+                ELSE u1.last_name
+            END as recipient_last_name,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u2.username
+                ELSE u1.username
+            END as recipient_username,
+            CASE 
+                WHEN f.requested_by = f.user_id_1 THEN u2.profile_picture
+                ELSE u1.profile_picture
+            END as recipient_profile_picture
+        FROM Friendships f
+        LEFT JOIN Users u1 ON f.user_id_1 = u1.user_id
+        LEFT JOIN Users u2 ON f.user_id_2 = u2.user_id
+        WHERE (f.user_id_1 = %s OR f.user_id_2 = %s)
+        AND f.status = 'pending'
+        AND f.requested_by = %s
+        ORDER BY f.created_at DESC
+    """, (current_user_id, current_user_id, current_user_id))
+    
+    requests = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return requests
+
+
+@router.get("/friends")
+def get_friends(request: Request):
+    """
+    Get all accepted friends for the current user.
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Get accepted friendships
+    cur.execute("""
+        SELECT 
+            f.friendship_id,
+            f.user_id_1,
+            f.user_id_2,
+            f.status,
+            f.created_at,
+            CASE 
+                WHEN f.user_id_1 = %s THEN f.user_id_2
+                ELSE f.user_id_1
+            END as friend_user_id,
+            CASE 
+                WHEN f.user_id_1 = %s THEN u2.user_id
+                ELSE u1.user_id
+            END as friend_id,
+            CASE 
+                WHEN f.user_id_1 = %s THEN u2.first_name
+                ELSE u1.first_name
+            END as friend_first_name,
+            CASE 
+                WHEN f.user_id_1 = %s THEN u2.last_name
+                ELSE u1.last_name
+            END as friend_last_name,
+            CASE 
+                WHEN f.user_id_1 = %s THEN u2.username
+                ELSE u1.username
+            END as friend_username,
+            CASE 
+                WHEN f.user_id_1 = %s THEN u2.profile_picture
+                ELSE u1.profile_picture
+            END as friend_profile_picture
+        FROM Friendships f
+        LEFT JOIN Users u1 ON f.user_id_1 = u1.user_id
+        LEFT JOIN Users u2 ON f.user_id_2 = u2.user_id
+        WHERE (f.user_id_1 = %s OR f.user_id_2 = %s)
+        AND f.status = 'accepted'
+        ORDER BY f.created_at DESC
+    """, (current_user_id, current_user_id, current_user_id, current_user_id,
+          current_user_id, current_user_id, current_user_id, current_user_id))
+    
+    friends = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return friends
+
+
+@router.put("/friends/requests/{friendship_id}/accept")
+def accept_friend_request(
+    friendship_id: int,
+    request: Request
+):
+    """
+    Accept a pending friend request.
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Get friendship
+    cur.execute("""
+        SELECT friendship_id, user_id_1, user_id_2, status
+        FROM Friendships
+        WHERE friendship_id = %s
+    """, (friendship_id,))
+    
+    friendship = cur.fetchone()
+    if not friendship:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Friend request not found")
+    
+    # Verify current user is the recipient
+    if friendship['user_id_1'] != current_user_id and friendship['user_id_2'] != current_user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only accept friend requests sent to you")
+    
+    # Verify status is pending
+    if friendship['status'] != 'pending':
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=400, detail=f"Friend request is already {friendship['status']}")
+    
+    # Update status to accepted
+    cur.execute("""
+        UPDATE Friendships
+        SET status = 'accepted'
+        WHERE friendship_id = %s
+    """, (friendship_id,))
+    
+    cnx.commit()
+    
+    cur.execute("""
+        SELECT friendship_id, user_id_1, user_id_2, status, created_at
+        FROM Friendships
+        WHERE friendship_id = %s
+    """, (friendship_id,))
+    
+    result = cur.fetchone()
+    cur.close()
+    cnx.close()
+    
+    return result
+
+
+@router.delete("/friends/requests/{friendship_id}/reject")
+def reject_friend_request(
+    friendship_id: int,
+    request: Request
+):
+    """
+    Reject or cancel a pending friend request.
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Get friendship
+    cur.execute("""
+        SELECT friendship_id, user_id_1, user_id_2, status
+        FROM Friendships
+        WHERE friendship_id = %s
+    """, (friendship_id,))
+    
+    friendship = cur.fetchone()
+    if not friendship:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Friend request not found")
+    
+    # Verify current user is involved in this friendship
+    if friendship['user_id_1'] != current_user_id and friendship['user_id_2'] != current_user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only reject friend requests you are involved in")
+    
+    # Delete the friendship
+    cur.execute("DELETE FROM Friendships WHERE friendship_id = %s", (friendship_id,))
+    cnx.commit()
+    
+    cur.close()
+    cnx.close()
+    return {"status": "deleted", "friendship_id": friendship_id}
+
+
+@router.delete("/friends/{friendship_id}")
+def remove_friend(
+    friendship_id: int,
+    request: Request
+):
+    """
+    Remove an accepted friendship (unfriend).
+    Trusts x-firebase-uid header from API Gateway.
+    """
+    firebase_uid = get_firebase_uid_from_header(request)
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    
+    # Get current user
+    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
+    current_user = cur.fetchone()
+    if not current_user:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Current user not found")
+    
+    current_user_id = current_user['user_id']
+    
+    # Get friendship
+    cur.execute("""
+        SELECT friendship_id, user_id_1, user_id_2, status
+        FROM Friendships
+        WHERE friendship_id = %s
+    """, (friendship_id,))
+    
+    friendship = cur.fetchone()
+    if not friendship:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=404, detail="Friendship not found")
+    
+    # Verify current user is involved
+    if friendship['user_id_1'] != current_user_id and friendship['user_id_2'] != current_user_id:
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=403, detail="You can only remove your own friendships")
+    
+    # Delete the friendship
+    cur.execute("DELETE FROM Friendships WHERE friendship_id = %s", (friendship_id,))
+    cnx.commit()
+    
+    cur.close()
+    cnx.close()
+    return {"status": "deleted", "friendship_id": friendship_id}
 
 
 @router.get("/{user_id}")

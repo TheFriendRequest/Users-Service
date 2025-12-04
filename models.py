@@ -26,3 +26,17 @@ class UserUpdate(BaseModel):
     email: Optional[str] = None
     profile_picture: Optional[str] = None
     role: Optional[str] = None  # Role can be updated (admin-only typically)
+
+
+class FriendRequestCreate(BaseModel):
+    """Model for creating a friend request"""
+    to_user_id: int
+
+
+class FriendRequestResponse(BaseModel):
+    """Model for friend request response"""
+    friendship_id: int
+    user_id_1: int
+    user_id_2: int
+    status: str
+    created_at: str
